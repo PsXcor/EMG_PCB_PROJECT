@@ -1,0 +1,140 @@
+(kicad_sch
+	(version 20250114)
+	(generator "eeschema")
+	(generator_version "9.0")
+	(uuid "8502379e-357c-45ea-ab3e-cb866236add0")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 106.68 24.13)
+		(size 64.77 76.2)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0.0000)
+		)
+		(uuid "28d14412-6d8d-4bd5-86e7-5320cde0412e")
+		(property "Sheetname" "MCU_Section"
+			(at 106.68 23.4184 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "MCU_Section.kicad_sch"
+			(at 106.68 100.9146 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "EMG_PCB"
+				(path "/8502379e-357c-45ea-ab3e-cb866236add0"
+					(page "2")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 17.78 21.59)
+		(size 82.55 93.98)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0.0000)
+		)
+		(uuid "b353665e-1ddd-42d9-9d31-9ee3772fa643")
+		(property "Sheetname" "ADS1299_Section"
+			(at 17.78 20.8784 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "ADS1299_Section.kicad_sch"
+			(at 17.78 116.1546 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "EMG_PCB"
+				(path "/8502379e-357c-45ea-ab3e-cb866236add0"
+					(page "3")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 175.26 27.94)
+		(size 99.06 76.2)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0.0000)
+		)
+		(uuid "c1607389-6370-47f3-9fc7-151649ddb717")
+		(property "Sheetname" "Power_Supplies"
+			(at 175.26 27.2284 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "Power_Supplies.kicad_sch"
+			(at 175.26 104.7246 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "EMG_PCB"
+				(path "/8502379e-357c-45ea-ab3e-cb866236add0"
+					(page "4")
+				)
+			)
+		)
+	)
+	(sheet_instances
+		(path "/"
+			(page "1")
+		)
+	)
+	(embedded_fonts no)
+)

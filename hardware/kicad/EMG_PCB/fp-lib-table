@@ -1,0 +1,8 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "XIAO_nRF52840")(type "KiCad")(uri "${KIPRJMOD}/lib/footprints/XIAO_nRF52840.pretty")(options "")(descr ""))
+  (lib (name "ADS1299-4PAG")(type "KiCad")(uri "${KIPRJMOD}/lib/footprints/ADS1299-4PAG.pretty")(options "")(descr ""))
+  (lib (name "SOT50P160")(type "KiCad")(uri "${KIPRJMOD}/lib/footprints/SOT50P160.pretty")(options "")(descr ""))
+  (lib (name "Molex_connector")(type "KiCad")(uri "${KIPRJMOD}/lib/footprints/Molex_connector.pretty")(options "")(descr ""))
+  (lib (name "ESD_USB")(type "KiCad")(uri "${KIPRJMOD}/lib/footprints/ESD_USB.pretty")(options "")(descr ""))
+)
