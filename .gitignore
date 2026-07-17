@@ -1,0 +1,14 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# PyCharm
+.idea/
+
+# Python generated files
+__pycache__/
+*.pyc
+
+# Secrets
+.env
