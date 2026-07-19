@@ -1,6 +1,7 @@
 """
 Receive 20-byte Nykin-EMG BLE notifications, decode ADS1299 Channel 4
-samples, plot them live, and optionally save them to CSV.
+samples, apply the sample-rate-adaptive EMG detector and filters, display
+synchronized raw and filtered plots, and optionally save both to CSV.
 
 Examples:
     python emg_ble_receiver.py
@@ -15,12 +16,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import math
 import signal
 import struct
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +43,16 @@ PLOT_UPDATE_INTERVAL_S = 0.05
 STATS_PRINT_INTERVAL_S = 5.0
 CSV_SETTLE_TIME_S = 2.0
 
+# Sample-rate-adaptive filtering and detector settings.
+PLOT_ENVELOPE = False       # False = filtered samples, True = detector envelope
+NOTCH_FREQUENCY_HZ = 60.0
+NOTCH_Q = 30.0
+LOW_PASS_CUTOFF_HZ = 80.0
+LOW_PASS_Q = 1.0 / math.sqrt(2.0)
+BASELINE_CUTOFF_HZ = 43.0
+DECAY_FACTOR = 10.0
+THRESHOLD_FORGET_TIME_SECONDS = 40.0
+
 
 @dataclass(frozen=True)
 class SampleRecord:
@@ -48,6 +60,139 @@ class SampleRecord:
     sample_index: int
     raw_adc_count: int
     packet_sequence: int
+    filtered_adc_count: float = 0.0
+    detector_envelope: float = 0.0
+    activity_detected: bool = False
+
+
+class EmgFilter:
+    """Stateful sample-by-sample implementation of the EMG algorithm."""
+
+    def __init__(self) -> None:
+        nyquist_frequency = SAMPLE_RATE_HZ / 2.0
+
+        if not 0.0 < NOTCH_FREQUENCY_HZ < nyquist_frequency:
+            raise ValueError(
+                "NOTCH_FREQUENCY_HZ must be below the Nyquist frequency."
+            )
+        if not 0.0 < LOW_PASS_CUTOFF_HZ < nyquist_frequency:
+            raise ValueError(
+                "LOW_PASS_CUTOFF_HZ must be below the Nyquist frequency."
+            )
+        if not 0.0 < BASELINE_CUTOFF_HZ < nyquist_frequency:
+            raise ValueError(
+                "BASELINE_CUTOFF_HZ must be below the Nyquist frequency."
+            )
+        if NOTCH_Q <= 0.0 or LOW_PASS_Q <= 0.0:
+            raise ValueError("Filter Q values must be greater than zero.")
+
+        self.moving_average_factor = math.exp(
+            -2.0 * math.pi * BASELINE_CUTOFF_HZ / SAMPLE_RATE_HZ
+        )
+        self.threshold_decay_factor = math.exp(
+            -1.0 / (SAMPLE_RATE_HZ * THRESHOLD_FORGET_TIME_SECONDS)
+        )
+
+        notch_w0 = 2.0 * math.pi * NOTCH_FREQUENCY_HZ / SAMPLE_RATE_HZ
+        notch_alpha = math.sin(notch_w0) / (2.0 * NOTCH_Q)
+        notch_a0 = 1.0 + notch_alpha
+        self.notch_b0 = 1.0 / notch_a0
+        self.notch_b1 = -2.0 * math.cos(notch_w0) / notch_a0
+        self.notch_b2 = 1.0 / notch_a0
+        self.notch_a1 = -2.0 * math.cos(notch_w0) / notch_a0
+        self.notch_a2 = (1.0 - notch_alpha) / notch_a0
+
+        low_w0 = 2.0 * math.pi * LOW_PASS_CUTOFF_HZ / SAMPLE_RATE_HZ
+        low_alpha = math.sin(low_w0) / (2.0 * LOW_PASS_Q)
+        low_cos_w0 = math.cos(low_w0)
+        low_a0 = 1.0 + low_alpha
+        self.low_b0 = ((1.0 - low_cos_w0) / 2.0) / low_a0
+        self.low_b1 = (1.0 - low_cos_w0) / low_a0
+        self.low_b2 = ((1.0 - low_cos_w0) / 2.0) / low_a0
+        self.low_a1 = (-2.0 * low_cos_w0) / low_a0
+        self.low_a2 = (1.0 - low_alpha) / low_a0
+
+        self.moving_average = 0.0
+        self.decay = 0.0
+        self.detector_id = 0.0
+        self.detection_threshold = 0.0
+        self.data_in = 0.0
+        self.sample_count = 0
+
+        self.notch_x1 = 0.0
+        self.notch_x2 = 0.0
+        self.notch_y1 = 0.0
+        self.notch_y2 = 0.0
+
+        self.low_x1 = 0.0
+        self.low_x2 = 0.0
+        self.low_y1 = 0.0
+        self.low_y2 = 0.0
+
+    def process_record(self, record: SampleRecord) -> SampleRecord:
+        data_in_old = self.data_in
+        self.data_in = float(record.raw_adc_count)
+
+        if self.sample_count == 0:
+            self.moving_average = self.data_in
+        else:
+            self.moving_average = (
+                self.moving_average_factor * self.moving_average
+                + (1.0 - self.moving_average_factor) * self.data_in
+            )
+            self.detection_threshold = max(
+                self.detection_threshold,
+                3.0 * abs(self.data_in - data_in_old),
+            )
+            self.detection_threshold *= self.threshold_decay_factor
+
+        dc_removed = self.data_in - self.moving_average
+
+        # The detector intentionally uses the unfiltered, DC-removed sample.
+        detector_data_point = dc_removed
+
+        notch_output = (
+            self.notch_b0 * dc_removed
+            + self.notch_b1 * self.notch_x1
+            + self.notch_b2 * self.notch_x2
+            - self.notch_a1 * self.notch_y1
+            - self.notch_a2 * self.notch_y2
+        )
+        self.notch_x2 = self.notch_x1
+        self.notch_x1 = dc_removed
+        self.notch_y2 = self.notch_y1
+        self.notch_y1 = notch_output
+
+        low_pass_output = (
+            self.low_b0 * notch_output
+            + self.low_b1 * self.low_x1
+            + self.low_b2 * self.low_x2
+            - self.low_a1 * self.low_y1
+            - self.low_a2 * self.low_y2
+        )
+        self.low_x2 = self.low_x1
+        self.low_x1 = notch_output
+        self.low_y2 = self.low_y1
+        self.low_y1 = low_pass_output
+
+        self.detector_id += abs(detector_data_point) - self.decay * DECAY_FACTOR
+        self.decay += 1.0
+
+        if self.detector_id < 0.0:
+            self.detector_id = 0.0
+            self.decay = 0.0
+
+        activity_detected = self.detector_id > self.detection_threshold
+        filtered_data_point = float(activity_detected) * low_pass_output
+        detector_envelope = float(activity_detected) * self.detector_id
+        self.sample_count += 1
+
+        return replace(
+            record,
+            filtered_adc_count=filtered_data_point,
+            detector_envelope=detector_envelope,
+            activity_detected=activity_detected,
+        )
 
 
 @dataclass
@@ -76,7 +221,7 @@ class ReceiverStats:
 
 
 class LivePlot:
-    """Matplotlib live plot updated only from the asyncio/main thread."""
+    """Two synchronized Matplotlib plots updated from the asyncio/main thread."""
 
     def __init__(
         self,
@@ -92,19 +237,30 @@ class LivePlot:
         self._seconds = seconds
         self._max_points = max(1, int(round(seconds * SAMPLE_RATE_HZ)))
         self._sample_indices: deque[int] = deque(maxlen=self._max_points)
-        self._sample_values: deque[int] = deque(maxlen=self._max_points)
+        self._raw_values: deque[int] = deque(maxlen=self._max_points)
+        self._filtered_values: deque[float] = deque(maxlen=self._max_points)
 
         plt.ion()
-        self._figure, self._axes = plt.subplots()
-        self._figure.subplots_adjust(bottom=0.16)
-        (self._line,) = self._axes.plot([], [])
-        self._axes.set_title("Nykin-EMG — ADS1299 Channel 4")
-        self._axes.set_xlabel("Time relative to newest sample (s)")
-        self._axes.set_ylabel("Raw ADC count")
-        self._axes.grid(True)
-        self._axes.set_xlim(-self._seconds, 0.0)
+        self._figure, axes = plt.subplots(2, 1, sharex=True)
+        self._raw_axes = axes[0]
+        self._filtered_axes = axes[1]
+        self._figure.subplots_adjust(bottom=0.14, hspace=0.28)
+        self._figure.suptitle("Nykin-EMG — ADS1299 Channel 4")
 
-        button_axes = self._figure.add_axes([0.78, 0.035, 0.18, 0.065])
+        (self._raw_line,) = self._raw_axes.plot([], [])
+        self._raw_axes.set_title("Raw / Unfiltered")
+        self._raw_axes.set_ylabel("Raw ADC count")
+        self._raw_axes.grid(True)
+        self._raw_axes.set_xlim(-self._seconds, 0.0)
+
+        (self._filtered_line,) = self._filtered_axes.plot([], [])
+        self._filtered_axes.set_title("Filtered")
+        self._filtered_axes.set_xlabel("Time relative to newest sample (s)")
+        self._filtered_axes.set_ylabel("Filtered ADC count")
+        self._filtered_axes.grid(True)
+        self._filtered_axes.set_xlim(-self._seconds, 0.0)
+
+        button_axes = self._figure.add_axes([0.78, 0.025, 0.18, 0.055])
         self._save_button = Button(button_axes, "Save CSV")
         self._save_button.on_clicked(lambda _event: save_csv_callback())
 
@@ -118,22 +274,32 @@ class LivePlot:
 
     def add_records(self, records: list[SampleRecord]) -> None:
         for record in records:
+            # The same sample index is used for both signals, keeping the plots
+            # aligned even when samples arrive in multi-sample BLE packets.
             self._sample_indices.append(record.sample_index)
-            self._sample_values.append(record.raw_adc_count)
+            self._raw_values.append(record.raw_adc_count)
+            self._filtered_values.append(record.filtered_adc_count)
 
     def refresh(self) -> None:
-        if self._sample_values:
+        if self._sample_indices:
             newest_index = self._sample_indices[-1]
             x_values = [
                 (sample_index - newest_index) / SAMPLE_RATE_HZ
                 for sample_index in self._sample_indices
             ]
-            y_values = list(self._sample_values)
 
-            self._line.set_data(x_values, y_values)
-            self._axes.relim()
-            self._axes.autoscale_view(scalex=False, scaley=True)
-            self._axes.set_xlim(-self._seconds, 0.0)
+            self._raw_line.set_data(x_values, list(self._raw_values))
+            self._filtered_line.set_data(x_values, list(self._filtered_values))
+
+            # Each graph gets its own y-scale because raw offsets and filtered
+            # activity can have very different amplitudes. Their shared x-axis
+            # keeps both displays synchronized in time.
+            self._raw_axes.relim()
+            self._raw_axes.autoscale_view(scalex=False, scaley=True)
+            self._filtered_axes.relim()
+            self._filtered_axes.autoscale_view(scalex=False, scaley=True)
+            self._filtered_axes.set_xlim(-self._seconds, 0.0)
+
             self._figure.canvas.draw_idle()
 
         # Runs the GUI event loop briefly. This is intentionally not called
@@ -178,6 +344,9 @@ def save_records_with_dialog(records: list[SampleRecord]) -> None:
                 "timestamp_unix_s",
                 "sample_index",
                 "raw_adc_count",
+                "filtered_adc_count",
+                "detector_envelope",
+                "activity_detected",
                 "packet_sequence",
             ]
         )
@@ -186,6 +355,9 @@ def save_records_with_dialog(records: list[SampleRecord]) -> None:
                 f"{record.timestamp_unix_s:.6f}",
                 record.sample_index,
                 record.raw_adc_count,
+                f"{record.filtered_adc_count:.6f}",
+                f"{record.detector_envelope:.6f}",
+                int(record.activity_detected),
                 record.packet_sequence,
             )
             for record in records
@@ -242,15 +414,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         metavar="PATH",
         help=(
-            "Write timestamp_unix_s, sample_index, raw_adc_count, and "
-            "packet_sequence to this CSV file. Existing files are replaced."
+            "Write raw and filtered samples, detector output, activity flag, "
+            "and packet metadata to this CSV file. Existing files are replaced."
         ),
     )
     parser.add_argument(
         "--seconds",
         type=plot_seconds,
         default=8.0,
-        help="Number of recent seconds shown in the live plot (default: 8).",
+        help="Number of recent seconds shown in both synchronized plots (default: 8).",
     )
     parser.add_argument(
         "--no-plot",
@@ -260,7 +432,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--print-samples",
         action="store_true",
-        help="Print every decoded raw sample as 'sample_index,raw_adc_count'.",
+        help=(
+            "Print each sample as sample_index,raw_adc_count,"
+            "filtered_adc_count,detector_envelope,activity_detected."
+        ),
     )
     parser.add_argument(
         "--scan-timeout",
@@ -593,6 +768,7 @@ async def record_consumer(
     csv_file = None
     csv_writer = None
     live_plot = None
+    signal_filter = EmgFilter()
     button_csv_records: list[SampleRecord] = []
     settled_sample_index: Optional[int] = None
 
@@ -609,6 +785,9 @@ async def record_consumer(
                     "timestamp_unix_s",
                     "sample_index",
                     "raw_adc_count",
+                    "filtered_adc_count",
+                    "detector_envelope",
+                    "activity_detected",
                     "packet_sequence",
                 ]
             )
@@ -641,6 +820,8 @@ async def record_consumer(
                     break
 
             if batch:
+                batch = [signal_filter.process_record(record) for record in batch]
+
                 if settled_sample_index is None:
                     settled_sample_index = (
                         batch[0].sample_index
@@ -655,7 +836,12 @@ async def record_consumer(
 
                 if args.print_samples:
                     for record in batch:
-                        print(f"{record.sample_index},{record.raw_adc_count}")
+                        print(
+                            f"{record.sample_index},{record.raw_adc_count},"
+                            f"{record.filtered_adc_count:.6f},"
+                            f"{record.detector_envelope:.6f},"
+                            f"{int(record.activity_detected)}"
+                        )
 
                 if csv_writer is not None:
                     csv_writer.writerows(
@@ -663,6 +849,9 @@ async def record_consumer(
                             f"{record.timestamp_unix_s:.6f}",
                             record.sample_index,
                             record.raw_adc_count,
+                            f"{record.filtered_adc_count:.6f}",
+                            f"{record.detector_envelope:.6f}",
+                            int(record.activity_detected),
                             record.packet_sequence,
                         )
                         for record in batch
