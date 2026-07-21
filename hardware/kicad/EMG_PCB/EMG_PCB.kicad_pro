@@ -570,7 +570,7 @@
       "plot": "EMG_PCB_Manufacture/",
       "pos_files": "",
       "specctra_dsn": "",
-      "step": "",
+      "step": "../../../Mechanical/PCB_Case/EMG_PCB_3D_Model.step",
       "svg": "",
       "vrml": ""
     },
