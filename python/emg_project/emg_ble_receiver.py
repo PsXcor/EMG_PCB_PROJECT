@@ -15,11 +15,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-
 import csv
 import math
-import multiprocessing as mp
-import queue as queue_module
 import signal
 import struct
 import sys
@@ -41,24 +38,8 @@ PROTOCOL_VERSION = 1
 PACKET_SIZE_BYTES = 20
 MAX_SAMPLES_PER_PACKET = 4
 SAMPLE_RATE_HZ = 250.0
-HOST_QUEUE_MAX_RECORDS = 8192
-
-# Plotting is intentionally much slower than the 250 Hz sample stream. The
-# plot still receives every sample, but the GUI is only repainted at a normal
-# screen rate so BLE notifications are not starved by Matplotlib.
-# The BLE/filter process publishes a complete rolling snapshot to a separate
-# plotting process. Matplotlib therefore cannot block BLE notifications.
-PLOT_SNAPSHOT_INTERVAL_S = 0.20
-PLOT_PROCESS_QUEUE_SIZE = 1
-PLOT_Y_AUTOSCALE_INTERVAL_S = 1.0
-PLOT_MAX_DISPLAY_POINTS = 1200
-SAMPLE_CONSUMER_WAIT_S = 0.02
-
-# Repeated console writes can further delay the asyncio/BLE event loop. Packet
-# loss is still counted exactly, but warnings are summarized at most once per
-# interval instead of printing one line for every missing packet.
-PACKET_WARNING_INTERVAL_S = 5.0
-
+HOST_QUEUE_MAX_RECORDS = 4096
+PLOT_UPDATE_INTERVAL_S = 0.05
 STATS_PRINT_INTERVAL_S = 5.0
 CSV_SETTLE_TIME_S = 2.0
 
@@ -226,8 +207,6 @@ class ReceiverStats:
     last_sequence: Optional[int] = None
     connection_generation: int = 0
     last_queue_warning_monotonic: float = 0.0
-    pending_missing_packet_warning: int = 0
-    last_packet_warning_monotonic: float = 0.0
 
     def begin_connection(self) -> int:
         """Start a new sequence-tracking epoch and return its generation ID."""
@@ -241,21 +220,105 @@ class ReceiverStats:
         self.last_sequence = None
 
 
-def _plot_limits(values: list[float]) -> tuple[float, float]:
-    if not values:
-        return (-1.0, 1.0)
+class LivePlot:
+    """Two synchronized Matplotlib plots updated from the asyncio/main thread."""
 
-    y_min = min(values)
-    y_max = max(values)
-    y_range = y_max - y_min
-    if y_range == 0.0:
-        padding = max(1.0, abs(y_max) * 0.05)
-    else:
-        padding = 0.08 * y_range
-    return (y_min - padding, y_max + padding)
+    def __init__(
+        self,
+        seconds: float,
+        stop_event: asyncio.Event,
+        save_csv_callback: object,
+    ) -> None:
+        # Lazy import allows --no-plot to run on headless systems.
+        import matplotlib.pyplot as plt
+        from matplotlib.widgets import Button
+
+        self._plt = plt
+        self._seconds = seconds
+        self._max_points = max(1, int(round(seconds * SAMPLE_RATE_HZ)))
+        self._sample_indices: deque[int] = deque(maxlen=self._max_points)
+        self._raw_values: deque[int] = deque(maxlen=self._max_points)
+        self._filtered_values: deque[float] = deque(maxlen=self._max_points)
+
+        plt.ion()
+        self._figure, axes = plt.subplots(2, 1, sharex=True)
+        self._raw_axes = axes[0]
+        self._filtered_axes = axes[1]
+        self._figure.subplots_adjust(bottom=0.14, hspace=0.28)
+        self._figure.suptitle("Nykin-EMG — ADS1299 Channel 4")
+
+        (self._raw_line,) = self._raw_axes.plot([], [])
+        self._raw_axes.set_title("Raw / Unfiltered")
+        self._raw_axes.set_ylabel("Raw ADC count")
+        self._raw_axes.grid(True)
+        self._raw_axes.set_xlim(-self._seconds, 0.0)
+
+        (self._filtered_line,) = self._filtered_axes.plot([], [])
+        self._filtered_axes.set_title("Filtered")
+        self._filtered_axes.set_xlabel("Time relative to newest sample (s)")
+        self._filtered_axes.set_ylabel("Filtered ADC count")
+        self._filtered_axes.grid(True)
+        self._filtered_axes.set_xlim(-self._seconds, 0.0)
+
+        button_axes = self._figure.add_axes([0.78, 0.025, 0.18, 0.055])
+        self._save_button = Button(button_axes, "Save CSV")
+        self._save_button.on_clicked(lambda _event: save_csv_callback())
+
+        loop = asyncio.get_running_loop()
+
+        def on_close(_event: object) -> None:
+            loop.call_soon_threadsafe(stop_event.set)
+
+        self._figure.canvas.mpl_connect("close_event", on_close)
+        plt.show(block=False)
+
+    def add_records(self, records: list[SampleRecord]) -> None:
+        for record in records:
+            # The same sample index is used for both signals, keeping the plots
+            # aligned even when samples arrive in multi-sample BLE packets.
+            self._sample_indices.append(record.sample_index)
+            self._raw_values.append(record.raw_adc_count)
+            self._filtered_values.append(record.filtered_adc_count)
+
+    def refresh(self) -> None:
+        if self._sample_indices:
+            newest_index = self._sample_indices[-1]
+            x_values = [
+                (sample_index - newest_index) / SAMPLE_RATE_HZ
+                for sample_index in self._sample_indices
+            ]
+
+            self._raw_line.set_data(x_values, list(self._raw_values))
+            self._filtered_line.set_data(x_values, list(self._filtered_values))
+
+            # Each graph gets its own y-scale because raw offsets and filtered
+            # activity can have very different amplitudes. Their shared x-axis
+            # keeps both displays synchronized in time.
+            self._raw_axes.relim()
+            self._raw_axes.autoscale_view(scalex=False, scaley=True)
+            self._filtered_axes.relim()
+            self._filtered_axes.autoscale_view(scalex=False, scaley=True)
+            self._filtered_axes.set_xlim(-self._seconds, 0.0)
+
+            self._figure.canvas.draw_idle()
+
+        # Runs the GUI event loop briefly. This is intentionally not called
+        # from the BLE notification callback.
+        self._plt.pause(0.001)
+
+    def close(self) -> None:
+        if self._plt.fignum_exists(self._figure.number):
+            self._plt.close(self._figure)
 
 
-def _open_save_dialog() -> Optional[str]:
+def save_records_with_dialog(records: list[SampleRecord]) -> None:
+    if not records:
+        print(
+            f"No settled samples to save yet. Wait at least "
+            f"{CSV_SETTLE_TIME_S:g} seconds after readings begin."
+        )
+        return
+
     from tkinter import Tk, filedialog
 
     root = Tk()
@@ -270,237 +333,10 @@ def _open_save_dialog() -> Optional[str]:
     finally:
         root.destroy()
 
-    return filename or None
-
-
-def plot_process_main(
-    seconds: float,
-    snapshot_queue: object,
-    command_queue: object,
-) -> None:
-    """Run the complete Matplotlib GUI in a separate OS process."""
-    import matplotlib.pyplot as plt
-    import numpy as np
-    from matplotlib.widgets import Button
-
-    figure, axes = plt.subplots(2, 1, sharex=True)
-    raw_axes = axes[0]
-    filtered_axes = axes[1]
-    figure.subplots_adjust(bottom=0.14, hspace=0.28)
-    figure.suptitle("Nykin-EMG — ADS1299 Channel 4")
-
-    (raw_line,) = raw_axes.plot([], [])
-    raw_axes.set_title("Raw / Unfiltered")
-    raw_axes.set_ylabel("Raw ADC count")
-    raw_axes.grid(True)
-    raw_axes.set_xlim(-seconds, 0.0)
-
-    (filtered_line,) = filtered_axes.plot([], [])
-    filtered_axes.set_title("Filtered")
-    filtered_axes.set_xlabel("Time relative to newest received sample (s)")
-    filtered_axes.set_ylabel("Filtered ADC count")
-    filtered_axes.grid(True)
-    filtered_axes.set_xlim(-seconds, 0.0)
-
-    button_axes = figure.add_axes([0.78, 0.025, 0.18, 0.055])
-    save_button = Button(button_axes, "Save CSV")
-
-    def request_save(_event: object) -> None:
-        filename = _open_save_dialog()
-        if filename is None:
-            return
-        try:
-            command_queue.put_nowait(("save", filename))
-        except queue_module.Full:
-            print("WARNING: save request queue was full.", file=sys.stderr)
-
-    save_button.on_clicked(request_save)
-
-    closed = False
-
-    def on_close(_event: object) -> None:
-        nonlocal closed
-        closed = True
-        try:
-            command_queue.put_nowait(("closed", None))
-        except queue_module.Full:
-            pass
-
-    figure.canvas.mpl_connect("close_event", on_close)
-    plt.show(block=False)
-
-    last_autoscale = 0.0
-    latest_snapshot = None
-
-    while not closed and plt.fignum_exists(figure.number):
-        # The queue contains only the newest complete rolling snapshot. Drain it
-        # so the plot never wastes time rendering stale frames.
-        try:
-            while True:
-                item = snapshot_queue.get_nowait()
-                if item is None:
-                    closed = True
-                    break
-                latest_snapshot = item
-        except queue_module.Empty:
-            pass
-
-        if latest_snapshot is not None and not closed:
-            timestamps, raw_values, filtered_values = latest_snapshot
-
-            if timestamps:
-                all_timestamps = np.asarray(timestamps, dtype=float)
-                all_raw_values = np.asarray(raw_values, dtype=float)
-                all_filtered_values = np.asarray(filtered_values, dtype=float)
-
-                display_stride = max(
-                    1,
-                    math.ceil(len(all_timestamps) / PLOT_MAX_DISPLAY_POINTS),
-                )
-                selected_indices = np.arange(
-                    0, len(all_timestamps), display_stride, dtype=int
-                )
-
-                newest_timestamp = all_timestamps[-1]
-                x_values = all_timestamps[selected_indices] - newest_timestamp
-                raw_display = all_raw_values[selected_indices].copy()
-                filtered_display = all_filtered_values[selected_indices].copy()
-
-                # Break the trace at missing-sample gaps rather than drawing a
-                # misleading straight line across lost BLE packets. This test
-                # is performed before display decimation, so normal decimation
-                # is not mistaken for packet loss.
-                if all_timestamps.size > 1 and selected_indices.size > 1:
-                    source_gaps = np.diff(all_timestamps) > (2.5 / SAMPLE_RATE_HZ)
-                    for display_position in range(1, selected_indices.size):
-                        previous_source = selected_indices[display_position - 1]
-                        current_source = selected_indices[display_position]
-                        if np.any(source_gaps[previous_source:current_source]):
-                            raw_display[display_position] = np.nan
-                            filtered_display[display_position] = np.nan
-
-                raw_line.set_data(x_values, raw_display)
-                filtered_line.set_data(x_values, filtered_display)
-
-                now = time.monotonic()
-                if now - last_autoscale >= PLOT_Y_AUTOSCALE_INTERVAL_S:
-                    last_autoscale = now
-                    raw_axes.set_ylim(*_plot_limits([float(v) for v in raw_values]))
-                    filtered_axes.set_ylim(
-                        *_plot_limits([float(v) for v in filtered_values])
-                    )
-
-                raw_axes.set_xlim(-seconds, 0.0)
-                filtered_axes.set_xlim(-seconds, 0.0)
-                figure.canvas.draw_idle()
-
-            latest_snapshot = None
-
-        # GUI work occurs only in this child process. Any slowdown here can at
-        # worst reduce display frame rate; it cannot delay Bleak callbacks.
-        plt.pause(0.02)
-
-    if plt.fignum_exists(figure.number):
-        plt.close(figure)
-
-
-class PlotProcessController:
-    """Publish synchronized snapshots without ever blocking BLE reception."""
-
-    def __init__(self, seconds: float) -> None:
-        self._seconds = seconds
-        self._max_points = max(1, int(round(seconds * SAMPLE_RATE_HZ)))
-        self._timestamps: deque[float] = deque(maxlen=self._max_points)
-        self._raw_values: deque[int] = deque(maxlen=self._max_points)
-        self._filtered_values: deque[float] = deque(maxlen=self._max_points)
-        self.snapshot_replacements = 0
-
-        context = mp.get_context("spawn")
-        self._snapshot_queue = context.Queue(maxsize=PLOT_PROCESS_QUEUE_SIZE)
-        self._command_queue = context.Queue(maxsize=8)
-        self._process = context.Process(
-            target=plot_process_main,
-            args=(seconds, self._snapshot_queue, self._command_queue),
-            name="NykinEmgPlot",
-        )
-        self._process.start()
-
-    def add_records(self, records: list[SampleRecord]) -> None:
-        for record in records:
-            self._timestamps.append(record.timestamp_unix_s)
-            self._raw_values.append(record.raw_adc_count)
-            self._filtered_values.append(record.filtered_adc_count)
-
-    def publish_latest(self) -> None:
-        snapshot = (
-            list(self._timestamps),
-            list(self._raw_values),
-            list(self._filtered_values),
-        )
-
-        try:
-            self._snapshot_queue.put_nowait(snapshot)
-            return
-        except queue_module.Full:
-            pass
-
-        # Replace an unrendered stale snapshot with the newest state. This is a
-        # display-only replacement; no acquisition, filtering, or CSV data is
-        # discarded.
-        try:
-            self._snapshot_queue.get_nowait()
-        except queue_module.Empty:
-            pass
-
-        try:
-            self._snapshot_queue.put_nowait(snapshot)
-            self.snapshot_replacements += 1
-        except queue_module.Full:
-            self.snapshot_replacements += 1
-
-    def poll_commands(self) -> list[tuple[str, Optional[str]]]:
-        commands: list[tuple[str, Optional[str]]] = []
-        while True:
-            try:
-                commands.append(self._command_queue.get_nowait())
-            except queue_module.Empty:
-                break
-        return commands
-
-    def is_alive(self) -> bool:
-        return self._process.is_alive()
-
-    def close(self) -> None:
-        try:
-            self._snapshot_queue.put_nowait(None)
-        except queue_module.Full:
-            try:
-                self._snapshot_queue.get_nowait()
-            except queue_module.Empty:
-                pass
-            try:
-                self._snapshot_queue.put_nowait(None)
-            except queue_module.Full:
-                pass
-
-        self._process.join(timeout=2.0)
-        if self._process.is_alive():
-            self._process.terminate()
-            self._process.join(timeout=1.0)
-
-        self._snapshot_queue.close()
-        self._command_queue.close()
-
-
-def write_records_to_csv(records: list[SampleRecord], path: Path) -> None:
-    if not records:
-        print(
-            f"No settled samples to save yet. Wait at least "
-            f"{CSV_SETTLE_TIME_S:g} seconds after readings begin."
-        )
+    if not filename:
         return
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = Path(filename)
     with path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(
@@ -641,25 +477,11 @@ def report_packet_gap(stats: ReceiverStats, sequence: int) -> None:
 
         if forward_distance < 0x8000:
             stats.missing_packets += forward_distance
-            stats.pending_missing_packet_warning += forward_distance
-
-            # Console output is surprisingly expensive on Windows terminals.
-            # Summarize bursts of packet loss instead of printing one warning
-            # for every single gap. The exact total remains in ReceiverStats.
-            now = time.monotonic()
-            if (
-                now - stats.last_packet_warning_monotonic
-                >= PACKET_WARNING_INTERVAL_S
-            ):
-                print(
-                    "WARNING: BLE packet loss: "
-                    f"{stats.pending_missing_packet_warning} packet(s) missing "
-                    f"since the previous warning; total={stats.missing_packets}. "
-                    f"Latest expected sequence {expected}, received {sequence}",
-                    file=sys.stderr,
-                )
-                stats.pending_missing_packet_warning = 0
-                stats.last_packet_warning_monotonic = now
+            print(
+                f"WARNING: missing {forward_distance} BLE packet(s); "
+                f"expected sequence {expected}, received {sequence}",
+                file=sys.stderr,
+            )
         else:
             # BLE notifications should remain ordered. A backwards jump is
             # reported separately instead of being counted as ~65535 losses.
@@ -853,7 +675,6 @@ async def connection_manager(
                 )
 
             print("Connected. Expected sample characteristic was found.")
-            print(f"Negotiated ATT MTU: {client.mtu_size} bytes")
 
             try:
                 status_data = bytes(
@@ -869,10 +690,10 @@ async def connection_manager(
             generation = stats.begin_connection()
 
             def notification_callback(_sender: object, data: bytearray) -> None:
-                # Bleak already schedules notification callbacks onto its active
-                # asyncio loop. Decode immediately instead of adding a second
-                # call_soon_threadsafe hop for every packet.
-                decode_and_enqueue_packet(
+                # Bleak backends may invoke callbacks differently. Schedule all
+                # decoding onto the asyncio thread, where asyncio.Queue is safe.
+                loop.call_soon_threadsafe(
+                    decode_and_enqueue_packet,
                     bytes(data),
                     generation,
                     sample_queue,
@@ -884,12 +705,7 @@ async def connection_manager(
                 notification_callback,
             )
             notifications_started = True
-            print(
-                "Subscribed to Channel 4 notifications. "
-                "For diagnosis, run once with --no-plot: if packet loss "
-                "remains, the bottleneck is the BLE link/firmware rather "
-                "than Matplotlib."
-            )
+            print("Subscribed to Channel 4 notifications.")
 
             stop_wait = asyncio.create_task(stop_event.wait())
             disconnect_wait = asyncio.create_task(disconnected_event.wait())
@@ -951,11 +767,13 @@ async def record_consumer(
 ) -> None:
     csv_file = None
     csv_writer = None
-    plotter: Optional[PlotProcessController] = None
+    live_plot = None
     signal_filter = EmgFilter()
     button_csv_records: list[SampleRecord] = []
     settled_sample_index: Optional[int] = None
-    save_tasks: set[asyncio.Task[None]] = set()
+
+    def save_button_csv() -> None:
+        save_records_with_dialog(button_csv_records.copy())
 
     try:
         if args.csv is not None:
@@ -977,13 +795,9 @@ async def record_consumer(
             print(f"Recording CSV to: {args.csv.resolve()}")
 
         if not args.no_plot:
-            plotter = PlotProcessController(args.seconds)
-            print(
-                "Plot window started in a separate process; Matplotlib can no "
-                "longer block BLE notification handling."
-            )
+            live_plot = LivePlot(args.seconds, stop_event, save_button_csv)
 
-        last_plot_publish = time.monotonic()
+        last_plot_update = time.monotonic()
         last_stats_print = time.monotonic()
         last_csv_flush = time.monotonic()
 
@@ -993,7 +807,7 @@ async def record_consumer(
             try:
                 first_record = await asyncio.wait_for(
                     sample_queue.get(),
-                    timeout=SAMPLE_CONSUMER_WAIT_S,
+                    timeout=PLOT_UPDATE_INTERVAL_S,
                 )
                 batch.append(first_record)
             except asyncio.TimeoutError:
@@ -1043,40 +857,14 @@ async def record_consumer(
                         for record in batch
                     )
 
-                if plotter is not None:
-                    plotter.add_records(batch)
+                if live_plot is not None:
+                    live_plot.add_records(batch)
 
             now = time.monotonic()
 
-            if (
-                plotter is not None
-                and now - last_plot_publish >= PLOT_SNAPSHOT_INTERVAL_S
-            ):
-                last_plot_publish = now
-                plotter.publish_latest()
-
-            if plotter is not None:
-                for command, payload in plotter.poll_commands():
-                    if command == "closed":
-                        stop_event.set()
-                    elif command == "save" and payload is not None:
-                        records_snapshot = button_csv_records.copy()
-                        task = asyncio.create_task(
-                            asyncio.to_thread(
-                                write_records_to_csv,
-                                records_snapshot,
-                                Path(payload),
-                            )
-                        )
-                        save_tasks.add(task)
-                        task.add_done_callback(save_tasks.discard)
-
-                if not plotter.is_alive() and not stop_event.is_set():
-                    print(
-                        "Plot process exited unexpectedly; stopping receiver.",
-                        file=sys.stderr,
-                    )
-                    stop_event.set()
+            if live_plot is not None and now - last_plot_update >= PLOT_UPDATE_INTERVAL_S:
+                last_plot_update = now
+                live_plot.refresh()
 
             if csv_file is not None and now - last_csv_flush >= 1.0:
                 last_csv_flush = now
@@ -1084,27 +872,15 @@ async def record_consumer(
 
             if now - last_stats_print >= STATS_PRINT_INTERVAL_S:
                 last_stats_print = now
-                plot_replacements = (
-                    plotter.snapshot_replacements if plotter is not None else 0
-                )
-                total_expected_packets = stats.total_packets + stats.missing_packets
-                packet_loss_percent = (
-                    100.0 * stats.missing_packets / total_expected_packets
-                    if total_expected_packets
-                    else 0.0
-                )
                 print(
                     "Host totals: "
                     f"packets={stats.total_packets}, "
                     f"samples={stats.total_samples}, "
                     f"missing_packets={stats.missing_packets}, "
-                    f"packet_loss={packet_loss_percent:.1f}%, "
                     f"malformed={stats.malformed_packets}, "
                     f"protocol_errors={stats.protocol_errors}, "
                     f"out_of_order={stats.out_of_order_packets}, "
-                    f"host_queue_drops={stats.host_queue_drops}, "
-                    f"queue_depth={sample_queue.qsize()}, "
-                    f"plot_snapshot_replacements={plot_replacements}"
+                    f"host_queue_drops={stats.host_queue_drops}"
                 )
 
     finally:
@@ -1112,11 +888,8 @@ async def record_consumer(
             csv_file.flush()
             csv_file.close()
 
-        if plotter is not None:
-            plotter.close()
-
-        if save_tasks:
-            await asyncio.gather(*save_tasks, return_exceptions=True)
+        if live_plot is not None:
+            live_plot.close()
 
 
 async def async_main(args: argparse.Namespace) -> ReceiverStats:
@@ -1193,5 +966,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
     raise SystemExit(main())
